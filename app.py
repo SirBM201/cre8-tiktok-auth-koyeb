@@ -5,15 +5,22 @@ import requests
 from urllib.parse import urlencode
 from flask import Flask, request, redirect, jsonify
 
+from google.cloud import firestore
+
 app = Flask(__name__)
 
 CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
 CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")  # MUST be the Koyeb callback URL
+REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")
 SCOPES = os.getenv("TIKTOK_SCOPES", "video.publish,user.info.basic")
+
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+COLL = os.getenv("TIKTOK_FIRESTORE_COLLECTION", "tiktok_accounts")
 
 AUTHORIZE_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
+
+db = firestore.Client(project=FIREBASE_PROJECT_ID or None)
 
 def build_auth_url(state: str) -> str:
     params = {
@@ -66,21 +73,34 @@ def tiktok_callback():
 
     token_json = exchange_code_for_token(code)
 
-    # This is where your OPEN_ID comes from:
     open_id = token_json.get("open_id")
     if not open_id:
         return jsonify({"error": "Token response missing open_id", "raw": token_json}), 500
 
-    # IMPORTANT:
-    # Do NOT store tokens only on Koyeb local disk long-term.
-    # For now we return them so you can copy OPEN_ID and confirm the flow works.
-    # Next step: store tokens in Firestore/Supabase securely.
+    # Store securely in Firestore (document id = open_id)
+    now = int(time.time())
+    doc = {
+        "open_id": open_id,
+        "scope": token_json.get("scope"),
+        "token_type": token_json.get("token_type", "Bearer"),
+        "access_token": token_json.get("access_token"),
+        "refresh_token": token_json.get("refresh_token"),
+        "expires_in": int(token_json.get("expires_in", 0) or 0),
+        "refresh_expires_in": int(token_json.get("refresh_expires_in", 0) or 0),
+        "obtained_at": now,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "provider": "tiktok",
+        # later we will add: app_user_id, platform_account_label, etc.
+    }
+
+    db.collection(COLL).document(open_id).set(doc, merge=True)
+
+    # Return minimal info (do not leak tokens)
     return jsonify({
         "status": "connected",
         "open_id": open_id,
-        "scope": token_json.get("scope"),
-        "expires_in": token_json.get("expires_in"),
-        "note": "Copy open_id for testing. Next step is secure token storage."
+        "scope": doc["scope"],
+        "stored_in_firestore": True
     })
 
 if __name__ == "__main__":
