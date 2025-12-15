@@ -1,0 +1,18 @@
+name: TikTok Token Auto Refresh
+
+on:
+  schedule:
+    # Every 6 hours (UTC)
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call refresh_due endpoint
+        run: |
+          curl -sS -X POST \
+            "https://available-doro-bmsconcept-5df3438a.koyeb.app/api/tiktok/refresh_due?margin=21600&limit=50" \
+            -H "X-CRON-SECRET: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json"
