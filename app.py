@@ -14,13 +14,14 @@ CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")
 SCOPES = os.getenv("TIKTOK_SCOPES", "video.publish,user.info.basic")
 
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+# Firestore settings
+PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")  # e.g. cre8-studio
 COLL = os.getenv("TIKTOK_FIRESTORE_COLLECTION", "tiktok_accounts")
 
 AUTHORIZE_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
 
-db = firestore.Client(project=FIREBASE_PROJECT_ID or None)
+db = firestore.Client(project=PROJECT_ID or None)
 
 def build_auth_url(state: str) -> str:
     params = {
@@ -72,35 +73,36 @@ def tiktok_callback():
         return jsonify({"error": "Invalid state"}), 400
 
     token_json = exchange_code_for_token(code)
-
     open_id = token_json.get("open_id")
+
     if not open_id:
         return jsonify({"error": "Token response missing open_id", "raw": token_json}), 500
 
-    # Store securely in Firestore (document id = open_id)
     now = int(time.time())
+
     doc = {
         "open_id": open_id,
+        "provider": "tiktok",
         "scope": token_json.get("scope"),
         "token_type": token_json.get("token_type", "Bearer"),
+
+        # store tokens (server-side only)
         "access_token": token_json.get("access_token"),
         "refresh_token": token_json.get("refresh_token"),
+
         "expires_in": int(token_json.get("expires_in", 0) or 0),
         "refresh_expires_in": int(token_json.get("refresh_expires_in", 0) or 0),
         "obtained_at": now,
         "updated_at": firestore.SERVER_TIMESTAMP,
-        "provider": "tiktok",
-        # later we will add: app_user_id, platform_account_label, etc.
     }
 
     db.collection(COLL).document(open_id).set(doc, merge=True)
 
-    # Return minimal info (do not leak tokens)
     return jsonify({
         "status": "connected",
         "open_id": open_id,
-        "scope": doc["scope"],
-        "stored_in_firestore": True
+        "stored_in_firestore": True,
+        "collection": COLL
     })
 
 if __name__ == "__main__":
