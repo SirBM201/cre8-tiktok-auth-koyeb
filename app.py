@@ -12,6 +12,22 @@ from google.cloud import firestore
 # -------------------------------------------------
 app = Flask(__name__)
 
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+def require_cron_secret():
+    """
+    Protect internal endpoints (cron/manual admin calls) from being triggered by random people.
+    Client must send header: X-CRON-SECRET: <CRON_SECRET>
+    """
+    if not CRON_SECRET:
+        return False, (jsonify({"error": "Server misconfigured: CRON_SECRET not set"}), 500)
+
+    got = request.headers.get("X-CRON-SECRET", "")
+    if not got or got != CRON_SECRET:
+        return False, (jsonify({"error": "Unauthorized"}), 401)
+
+    return True, None
+
 # -------------------------------------------------
 # Environment variables
 # -------------------------------------------------
@@ -228,3 +244,4 @@ def refresh_due():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
