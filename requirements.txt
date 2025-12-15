@@ -1,9 +1,10 @@
 Flask==3.0.3
 gunicorn==22.0.0
 
-google-cloud-firestore==2.20.1
-google-auth==2.35.0
-
 requests==2.32.3
 python-dotenv==1.0.1
 
+google-cloud-firestore>=2.16.0
+google-auth>=2.30.0
+
+firebase-admin>=6.5.0
