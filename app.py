@@ -1,370 +1,301 @@
 import os
 import time
+import json
+import base64
 import secrets
-import logging
+import requests
+import boto3
 from urllib.parse import urlencode
 
-import requests
 from flask import Flask, request, redirect, jsonify
 from google.cloud import firestore
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("cre8-tiktok-auth")
-
-# -----------------------------
-# App
-# -----------------------------
 app = Flask(__name__)
 
-# -----------------------------
+# =========================
 # ENV
-# -----------------------------
-CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")
-SCOPES = os.getenv("TIKTOK_SCOPES", "video.publish,user.info.basic")
+# =========================
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
+TIKTOK_REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI", "")
+TIKTOK_SCOPES = os.getenv("TIKTOK_SCOPES", "user.info.basic,video.publish")
+TIKTOK_FIRESTORE_COLLECTION = os.getenv("TIKTOK_FIRESTORE_COLLECTION", "tiktok_accounts")
 
-PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")  # e.g. cre8-studio
-COLL = os.getenv("TIKTOK_FIRESTORE_COLLECTION", "tiktok_accounts")
-
-# Protect refresh endpoints
+# Cron protection secret (YOU set this in Koyeb env vars)
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
-# TikTok endpoints
-AUTHORIZE_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/"
-TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
+# AWS (for presigned URL)
+AWS_REGION = os.getenv("AWS_REGION", "")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+S3_BUCKET = os.getenv("S3_BUCKET", "fair-video-source")
 
-# Content posting (pull from URL) endpoint
-PUBLISH_INIT_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+# =========================
+# Firestore
+# =========================
+db = firestore.Client(project=FIREBASE_PROJECT_ID)
+col = db.collection(TIKTOK_FIRESTORE_COLLECTION)
 
-# -----------------------------
-# Firestore client
-# -----------------------------
-# GOOGLE_APPLICATION_CREDENTIALS should point to your service account json file
-db = firestore.Client(project=PROJECT_ID or None)
+# =========================
+# AWS S3
+# =========================
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+)
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
+# =========================
 def now_ts() -> int:
     return int(time.time())
 
-def build_auth_url(state: str) -> str:
-    params = {
-        "client_key": CLIENT_KEY,
-        "scope": SCOPES,
-        "response_type": "code",
-        "redirect_uri": REDIRECT_URI,
-        "state": state,
-    }
-    return f"{AUTHORIZE_ENDPOINT}?{urlencode(params)}"
+def require_cron_secret():
+    if not CRON_SECRET:
+        return (jsonify({"error": "CRON_SECRET not set on server"}), 500)
 
-def exchange_code_for_token(code: str) -> dict:
+    provided = request.headers.get("X-CRON-SECRET", "")
+    if not provided or provided != CRON_SECRET:
+        return (jsonify({"error": "Unauthorized: invalid X-CRON-SECRET"}), 401)
+    return None
+
+def tiktok_exchange_code_for_token(code: str):
+    # TikTok OAuth token endpoint
+    url = "https://open.tiktokapis.com/v2/oauth/token/"
     payload = {
-        "client_key": CLIENT_KEY,
-        "client_secret": CLIENT_SECRET,
+        "client_key": TIKTOK_CLIENT_KEY,
+        "client_secret": TIKTOK_CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": TIKTOK_REDIRECT_URI,
     }
-    r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=30)
+    r = requests.post(url, data=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def refresh_access_token(refresh_token: str) -> dict:
-    """
-    Refresh using TikTok refresh token.
-    """
+def tiktok_refresh_token(refresh_token: str):
+    url = "https://open.tiktokapis.com/v2/oauth/token/"
     payload = {
-        "client_key": CLIENT_KEY,
-        "client_secret": CLIENT_SECRET,
+        "client_key": TIKTOK_CLIENT_KEY,
+        "client_secret": TIKTOK_CLIENT_SECRET,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=30)
+    r = requests.post(url, data=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def require_cron_secret():
-    """
-    Require header: X-CRON-SECRET: <CRON_SECRET>
-    """
-    if not CRON_SECRET:
-        return False, (jsonify({"error": "Server misconfigured: CRON_SECRET not set"}), 500)
+def presign_s3_url(bucket: str, key: str, expires_seconds: int = 3600) -> str:
+    # Generates a temporary HTTPS URL TikTok can fetch
+    return s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
 
-    got = request.headers.get("X-CRON-SECRET", "")
-    if not got or got != CRON_SECRET:
-        return False, (jsonify({"error": "Unauthorized"}), 401)
+def token_is_expiring_soon(obtained_at: int, expires_in: int, buffer_seconds: int = 600) -> bool:
+    # refresh if within 10 minutes of expiry
+    return (obtained_at + expires_in) <= (now_ts() + buffer_seconds)
 
-    return True, None
-
-def get_account_doc(open_id: str):
-    ref = db.collection(COLL).document(open_id)
-    snap = ref.get()
-    if not snap.exists:
-        return None, None
-    return ref, snap.to_dict()
-
-def token_expires_soon(doc: dict, safety_window_seconds: int = 6 * 3600) -> bool:
-    """
-    Refresh only when access token is close to expiring.
-    Default: if token expires within next 6 hours.
-    """
-    obtained_at = int(doc.get("obtained_at", 0) or 0)
-    expires_in = int(doc.get("expires_in", 0) or 0)
-
-    if obtained_at <= 0 or expires_in <= 0:
-        # if unknown, treat as expiring soon
-        return True
-
-    expires_at = obtained_at + expires_in
-    return (expires_at - now_ts()) <= safety_window_seconds
-
-def safe_env_check():
-    missing = []
-    if not CLIENT_KEY: missing.append("TIKTOK_CLIENT_KEY")
-    if not CLIENT_SECRET: missing.append("TIKTOK_CLIENT_SECRET")
-    if not REDIRECT_URI: missing.append("TIKTOK_REDIRECT_URI")
-    return missing
-
-# -----------------------------
+# =========================
 # Routes
-# -----------------------------
+# =========================
+
 @app.get("/")
 def home():
-    return jsonify({"status": "ok", "service": "cre8-tiktok-auth"})
+    return "Cre8 Studio TikTok API server OK", 200
 
 @app.get("/api/tiktok/connect")
 def tiktok_connect():
-    missing = safe_env_check()
-    if missing:
-        return jsonify({"error": "Missing env vars", "missing": missing}), 500
-
-    state = secrets.token_urlsafe(24)
-    auth_url = build_auth_url(state)
-
-    resp = redirect(auth_url, code=302)
-    resp.set_cookie(
-        "tiktok_oauth_state",
-        state,
-        httponly=True,
-        samesite="Lax",
-        max_age=600,
-        secure=True,
-    )
-    return resp
+    # Creates TikTok auth URL
+    state = secrets.token_urlsafe(16)
+    params = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "scope": TIKTOK_SCOPES,
+        "response_type": "code",
+        "redirect_uri": TIKTOK_REDIRECT_URI,
+        "state": state,
+    }
+    auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(params)
+    return redirect(auth_url, code=302)
 
 @app.get("/api/tiktok/callback")
 def tiktok_callback():
     code = request.args.get("code")
-    state = request.args.get("state")
-    saved_state = request.cookies.get("tiktok_oauth_state")
-
     if not code:
         return jsonify({"error": "Missing code"}), 400
-    if not state or not saved_state or state != saved_state:
-        return jsonify({"error": "Invalid state"}), 400
 
-    token_json = exchange_code_for_token(code)
-    open_id = token_json.get("open_id")
-    if not open_id:
-        return jsonify({"error": "Token response missing open_id", "raw": token_json}), 500
+    data = tiktok_exchange_code_for_token(code)
 
-    now = now_ts()
+    # Typical TikTok response shape includes: access_token, refresh_token, expires_in, open_id, scope, token_type
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    expires_in = int(data.get("expires_in", 0))
+    open_id = data.get("open_id")
+    scope = data.get("scope", "")
+    token_type = data.get("token_type", "Bearer")
+
+    if not (access_token and refresh_token and open_id):
+        return jsonify({"error": "Token exchange returned incomplete data", "raw": data}), 500
 
     doc = {
-        "open_id": open_id,
         "provider": "tiktok",
-        "scope": token_json.get("scope"),
-        "token_type": token_json.get("token_type", "Bearer"),
-
-        # store tokens (server-side only)
-        "access_token": token_json.get("access_token"),
-        "refresh_token": token_json.get("refresh_token"),
-
-        "expires_in": int(token_json.get("expires_in", 0) or 0),
-        "refresh_expires_in": int(token_json.get("refresh_expires_in", 0) or 0),
-        "obtained_at": now,
+        "open_id": open_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": expires_in,
+        "scope": scope,
+        "token_type": token_type,
+        "obtained_at": now_ts(),
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
+    col.document(open_id).set(doc, merge=True)
 
-    db.collection(COLL).document(open_id).set(doc, merge=True)
+    return jsonify({"collection": TIKTOK_FIRESTORE_COLLECTION, "open_id": open_id, "status": "ok"}), 200
 
-    return jsonify({
-        "status": "connected",
-        "open_id": open_id,
-        "stored_in_firestore": True,
-        "collection": COLL
-    })
-
-# -----------------------------
-# Refresh endpoints
-# -----------------------------
 @app.post("/api/tiktok/refresh")
 def refresh_one():
-    ok, resp = require_cron_secret()
-    if not ok:
-        return resp
+    # Accepts open_id OR refresh_token in JSON
+    body = request.get_json(silent=True) or {}
+    open_id = body.get("open_id")
+    refresh_token = body.get("refresh_token")
 
-    payload = request.get_json(silent=True) or {}
-    open_id = payload.get("open_id")
-    refresh_token_input = payload.get("refresh_token")
-
-    if not open_id and not refresh_token_input:
+    if not open_id and not refresh_token:
         return jsonify({"error": "Provide open_id or refresh_token"}), 400
 
-    # If caller provides refresh_token directly, refresh immediately (no firestore read needed)
-    if refresh_token_input:
-        try:
-            token_json = refresh_access_token(refresh_token_input)
-            return jsonify({"status": "refreshed", "token_response": token_json})
-        except Exception as e:
-            return jsonify({"status": "error", "error": str(e)}), 500
+    if open_id:
+        snap = col.document(open_id).get()
+        if not snap.exists:
+            return jsonify({"error": "open_id not found", "open_id": open_id}), 404
+        doc = snap.to_dict()
+        refresh_token = doc.get("refresh_token")
+        obtained_at = int(doc.get("obtained_at", 0))
+        expires_in = int(doc.get("expires_in", 0))
 
-    # Otherwise, load from Firestore by open_id
-    ref, doc = get_account_doc(open_id)
-    if not doc:
-        return jsonify({"error": "open_id not found in Firestore", "open_id": open_id}), 404
+        if not token_is_expiring_soon(obtained_at, expires_in):
+            return jsonify({"open_id": open_id, "reason": "not_expiring_soon", "status": "skipped"}), 200
 
-    if not token_expires_soon(doc):
-        return jsonify({"status": "skipped", "open_id": open_id, "reason": "not_expiring_soon"})
+    data = tiktok_refresh_token(refresh_token)
 
-    rt = doc.get("refresh_token")
-    if not rt:
-        return jsonify({"status": "error", "open_id": open_id, "error": "Missing refresh_token in Firestore"}), 500
+    new_access = data.get("access_token")
+    new_refresh = data.get("refresh_token", refresh_token)
+    new_expires = int(data.get("expires_in", 0))
+    new_open_id = data.get("open_id", open_id)
 
-    try:
-        token_json = refresh_access_token(rt)
-        new_access = token_json.get("access_token")
-        new_refresh = token_json.get("refresh_token")
+    if not (new_access and new_open_id):
+        return jsonify({"error": "Refresh returned incomplete data", "raw": data}), 500
 
-        # Update Firestore (keep open_id doc id)
-        update_doc = {
-            "access_token": new_access or doc.get("access_token"),
-            "refresh_token": new_refresh or doc.get("refresh_token"),
-            "expires_in": int(token_json.get("expires_in", doc.get("expires_in", 0)) or 0),
-            "refresh_expires_in": int(token_json.get("refresh_expires_in", doc.get("refresh_expires_in", 0)) or 0),
-            "obtained_at": now_ts(),
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-        ref.set(update_doc, merge=True)
+    col.document(new_open_id).set({
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "expires_in": new_expires,
+        "obtained_at": now_ts(),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
 
-        return jsonify({
-            "status": "refreshed",
-            "open_id": open_id,
-            "updated": True,
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "open_id": open_id, "error": str(e)}), 500
-
+    return jsonify({"open_id": new_open_id, "status": "refreshed"}), 200
 
 @app.post("/api/tiktok/refresh_all")
 def refresh_all():
-    ok, resp = require_cron_secret()
-    if not ok:
-        return resp
+    # Protected endpoint for cron
+    auth_err = require_cron_secret()
+    if auth_err:
+        return auth_err
 
     processed = 0
     refreshed = 0
     skipped = 0
     errors = 0
 
-    # Stream all docs in collection
-    for snap in db.collection(COLL).stream():
+    for snap in col.stream():
         processed += 1
-        open_id = snap.id
         doc = snap.to_dict() or {}
+        open_id = doc.get("open_id", snap.id)
+        obtained_at = int(doc.get("obtained_at", 0))
+        expires_in = int(doc.get("expires_in", 0))
+        refresh_token = doc.get("refresh_token", "")
 
         try:
-            if not token_expires_soon(doc):
+            if not token_is_expiring_soon(obtained_at, expires_in):
                 skipped += 1
                 continue
 
-            rt = doc.get("refresh_token")
-            if not rt:
-                errors += 1
-                log.warning("Missing refresh_token for open_id=%s", open_id)
-                continue
+            data = tiktok_refresh_token(refresh_token)
+            new_access = data.get("access_token")
+            new_refresh = data.get("refresh_token", refresh_token)
+            new_expires = int(data.get("expires_in", 0))
 
-            token_json = refresh_access_token(rt)
+            if not new_access:
+                raise RuntimeError(f"Missing access_token in refresh response: {data}")
 
-            update_doc = {
-                "access_token": token_json.get("access_token", doc.get("access_token")),
-                "refresh_token": token_json.get("refresh_token", doc.get("refresh_token")),
-                "expires_in": int(token_json.get("expires_in", doc.get("expires_in", 0)) or 0),
-                "refresh_expires_in": int(token_json.get("refresh_expires_in", doc.get("refresh_expires_in", 0)) or 0),
+            col.document(open_id).set({
+                "access_token": new_access,
+                "refresh_token": new_refresh,
+                "expires_in": new_expires,
                 "obtained_at": now_ts(),
                 "updated_at": firestore.SERVER_TIMESTAMP,
-            }
+            }, merge=True)
 
-            db.collection(COLL).document(open_id).set(update_doc, merge=True)
             refreshed += 1
 
         except Exception as e:
             errors += 1
-            log.exception("Refresh failed for open_id=%s error=%s", open_id, str(e))
 
     return jsonify({
-        "status": "ok",
+        "collection": TIKTOK_FIRESTORE_COLLECTION,
         "processed": processed,
         "refreshed": refreshed,
         "skipped": skipped,
         "errors": errors,
-        "collection": COLL
-    })
+        "status": "ok",
+    }), 200
 
-# -----------------------------
-# Publish: PULL_FROM_URL (starter)
-# -----------------------------
-@app.post("/api/tiktok/publish/pull")
-def tiktok_publish_pull():
+@app.post("/api/tiktok/publish_init")
+def publish_init():
     """
-    Publish video to TikTok by letting TikTok pull from a public URL.
     Body JSON:
     {
       "open_id": "...",
-      "video_url": "https://.../video.mp4",
-      "title": "caption text",
-      "privacy_level": "SELF_ONLY"  # optional
+      "s3_key": "posted/reels n shorts/9am content/2025-12-14 Faceless Coronation.mp4",
+      "title": "Cre8 Studio test post",
+      "privacy_level": "SELF_ONLY"
     }
     """
-    # Protect this too (so random users can't publish from your server)
-    ok, resp = require_cron_secret()
-    if not ok:
-        return resp
+    body = request.get_json(silent=True) or {}
+    open_id = body.get("open_id")
+    s3_key = body.get("s3_key")
+    title = body.get("title", "")
+    privacy_level = body.get("privacy_level", "SELF_ONLY")
 
-    data = request.get_json(silent=True) or {}
-    open_id = data.get("open_id")
-    video_url = data.get("video_url")
-    title = data.get("title", "Cre8 Studio")
-    privacy_level = data.get("privacy_level", "SELF_ONLY")
+    if not open_id or not s3_key:
+        return jsonify({"error": "open_id and s3_key are required"}), 400
 
-    if not open_id or not video_url:
-        return jsonify({"error": "open_id and video_url are required"}), 400
+    snap = col.document(open_id).get()
+    if not snap.exists:
+        return jsonify({"error": "open_id not found", "open_id": open_id}), 404
 
-    _, doc = get_account_doc(open_id)
-    if not doc:
-        return jsonify({"error": "open_id not found in Firestore", "open_id": open_id}), 404
-
-    access_token = doc.get("access_token")
+    acct = snap.to_dict() or {}
+    access_token = acct.get("access_token")
     if not access_token:
-        return jsonify({"error": "Missing access_token in Firestore", "open_id": open_id}), 500
+        return jsonify({"error": "Missing access_token for open_id", "open_id": open_id}), 500
 
+    # Generate presigned URL (TikTok can fetch this)
+    video_url = presign_s3_url(S3_BUCKET, s3_key, expires_seconds=3600)
+
+    # TikTok init endpoint
+    url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json; charset=UTF-8",
     }
-
     payload = {
         "post_info": {
             "title": title,
             "privacy_level": privacy_level,
-            "disable_comment": False,
-            "disable_duet": False,
-            "disable_stitch": False,
         },
         "source_info": {
             "source": "PULL_FROM_URL",
@@ -372,35 +303,18 @@ def tiktok_publish_pull():
         }
     }
 
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    # Return TikTok response even when not 200, to help debugging
     try:
-        r = requests.post(PUBLISH_INIT_ENDPOINT, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        out = r.json()
+        data = r.json()
+    except Exception:
+        data = {"raw_text": r.text}
 
-        # store publish attempt (optional but recommended)
-        publish_id = None
-        if isinstance(out, dict):
-            publish_id = (out.get("data") or {}).get("publish_id")
+    if r.status_code >= 400:
+        return jsonify({"status": "error", "http": r.status_code, "tiktok": data}), 400
 
-        if publish_id:
-            db.collection(COLL).document(open_id).collection("publishes").document(publish_id).set({
-                "publish_id": publish_id,
-                "video_url": video_url,
-                "title": title,
-                "privacy_level": privacy_level,
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "raw_response": out,
-            }, merge=True)
-
-        return jsonify({"status": "ok", "open_id": open_id, "response": out})
-    except Exception as e:
-        return jsonify({"status": "error", "open_id": open_id, "error": str(e)}), 500
+    return jsonify({"status": "ok", "open_id": open_id, "video_url": video_url, "tiktok": data}), 200
 
 
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
