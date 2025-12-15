@@ -51,6 +51,14 @@ s3 = boto3.client(
 # =========================
 # Helpers
 # =========================
+@app.get("/api/routes")
+def list_routes():
+    routes = []
+    for r in app.url_map.iter_rules():
+        routes.append({"rule": str(r), "methods": sorted([m for m in r.methods if m not in ("HEAD","OPTIONS")])})
+    return jsonify(sorted(routes, key=lambda x: x["rule"]))
+
+
 def now_ts() -> int:
     return int(time.time())
 
@@ -318,3 +326,4 @@ def publish_init():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
