@@ -1,0 +1,41 @@
+def refresh_access_token_if_needed(open_id: str) -> str:
+    snap = db.collection(COLL).document(open_id).get()
+    if not snap.exists:
+        raise RuntimeError("TikTok account not found")
+
+    acct = snap.to_dict()
+    now = int(time.time())
+
+    expires_in = int(acct.get("expires_in", 0))
+    obtained_at = int(acct.get("obtained_at", 0))
+    refresh_token = acct.get("refresh_token")
+
+    # Refresh if expired or within 5 minutes of expiry
+    if expires_in and (obtained_at + expires_in - 300) > now:
+        return acct.get("access_token")
+
+    if not refresh_token:
+        raise RuntimeError("Missing refresh_token")
+
+    payload = {
+        "client_key": CLIENT_KEY,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    updated = {
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token", refresh_token),
+        "expires_in": int(data.get("expires_in", 0)),
+        "refresh_expires_in": int(data.get("refresh_expires_in", 0)),
+        "obtained_at": int(time.time()),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    db.collection(COLL).document(open_id).update(updated)
+    return updated["access_token"]
