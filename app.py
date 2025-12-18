@@ -1,6 +1,5 @@
 import os
 import math
-import time
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -59,15 +58,13 @@ TIKTOK_STATUS_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/status/fet
 
 # Upload tuning
 DEFAULT_EXPIRES_SECONDS = int(os.getenv("DEFAULT_EXPIRES_SECONDS", "7200"))
+S3_DOWNLOAD_MAX_MB = int(os.getenv("S3_DOWNLOAD_MAX_MB", "300"))
 
-# TikTok docs show FILE_UPLOAD can be done as SINGLE chunk for <= 64MB:
-# chunk_size = video_size, total_chunk_count = 1
-TIKTOK_SINGLE_CHUNK_MAX_BYTES = int(os.getenv("TIKTOK_SINGLE_CHUNK_MAX_BYTES", str(64 * 1024 * 1024)))
+# Chunk size for upload (keep 5MB as safe standard)
+TIKTOK_CHUNK_SIZE = int(os.getenv("TIKTOK_CHUNK_SIZE", str(5 * 1024 * 1024)))  # 5MB
 
-# Fallback chunk size ONLY if file > 64MB
-TIKTOK_FALLBACK_CHUNK_SIZE = int(os.getenv("TIKTOK_FALLBACK_CHUNK_SIZE", str(5 * 1024 * 1024)))  # 5MB
-
-S3_DOWNLOAD_MAX_MB = int(os.getenv("S3_DOWNLOAD_MAX_MB", "300"))  # safety
+# PUBLIC posting toggle (set to 1 only after TikTok audit approval)
+TIKTOK_ALLOW_PUBLIC = os.getenv("TIKTOK_ALLOW_PUBLIC", "0").strip() == "1"
 
 # Boto3 client
 s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -82,9 +79,6 @@ def now_utc():
     return datetime.now(timezone.utc).isoformat()
 
 def json_body():
-    """
-    Safe JSON parsing with clear errors.
-    """
     try:
         data = request.get_json(force=True, silent=False)
         if data is None:
@@ -96,89 +90,68 @@ def json_body():
 def s3_head_object(bucket: str, key: str):
     return s3.head_object(Bucket=bucket, Key=key)
 
-def s3_presigned_get(bucket: str, key: str, expires: int):
-    return s3.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=expires
-    )
-
 def tiktok_headers(access_token: str):
     return {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
 
-def _chunk_plan(video_size: int):
+def normalize_privacy_level(v: str) -> str:
     """
-    TikTok allows chunking, but for <= 64MB TikTok explicitly suggests:
-      chunk_size = video_size
-      total_chunk_count = 1
-    This avoids 'invalid chunk size' and 'invalid total chunk count' errors.
+    Normalize common inputs to TikTok-supported values used in our system.
     """
-    if video_size <= TIKTOK_SINGLE_CHUNK_MAX_BYTES:
-        chunk_size = video_size
-        total_chunks = 1
-        mode = "single"
-    else:
-        chunk_size = TIKTOK_FALLBACK_CHUNK_SIZE
-        total_chunks = math.ceil(video_size / chunk_size)
-        mode = "chunked"
-    return chunk_size, int(total_chunks), mode
-
-def tiktok_init_pull_from_url(access_token: str, video_url: str, title: str, privacy_level: str):
-    payload = {
-        "post_info": {
-            "title": title,
-            "privacy_level": privacy_level
-        },
-        "source_info": {
-            "source": "PULL_FROM_URL",
-            "video_url": video_url
-        }
+    if not v:
+        return "SELF_ONLY"
+    v = str(v).strip().upper()
+    mapping = {
+        "PRIVATE": "SELF_ONLY",
+        "SELF_ONLY": "SELF_ONLY",
+        "PUBLIC": "PUBLIC_TO_EVERYONE",
+        "PUBLIC_TO_EVERYONE": "PUBLIC_TO_EVERYONE",
+        "EVERYONE": "PUBLIC_TO_EVERYONE",
     }
-    r = requests.post(TIKTOK_INIT_ENDPOINT, headers=tiktok_headers(access_token), json=payload, timeout=60)
-    return r
+    return mapping.get(v, v)
+
+def _extract_tiktok_data(resp_json: dict):
+    data = resp_json.get("data") or {}
+    err = resp_json.get("error") or {}
+    return data, err
 
 def tiktok_init_file_upload(access_token: str, video_size: int, title: str, privacy_level: str):
     """
-    ✅ OPTION B: FILE_UPLOAD init
-    Uses TikTok-recommended single-chunk settings for <=64MB:
+    FILE_UPLOAD init.
+    To keep your working path stable, we use single-chunk init for smaller files:
       chunk_size = video_size
       total_chunk_count = 1
+    If file becomes larger later, switch to chunking via env or code expansion.
     """
-    chunk_size, total_chunks, mode = _chunk_plan(video_size)
-
     payload = {
         "post_info": {
             "title": title,
-            "privacy_level": privacy_level
+            "privacy_level": normalize_privacy_level(privacy_level),
         },
         "source_info": {
             "source": "FILE_UPLOAD",
             "video_size": int(video_size),
-            "chunk_size": int(chunk_size),
-            "total_chunk_count": int(total_chunks)
+
+            # Keep your previously-working approach (single chunk)
+            "chunk_size": int(video_size),
+            "total_chunk_count": 1,
         }
     }
 
-    log.info(f"TikTok init FILE_UPLOAD plan: mode={mode} video_size={video_size} chunk_size={chunk_size} total_chunks={total_chunks}")
-
-    r = requests.post(TIKTOK_INIT_ENDPOINT, headers=tiktok_headers(access_token), json=payload, timeout=60)
-    return r, payload  # return payload too (for debugging)
+    r = requests.post(
+        TIKTOK_INIT_ENDPOINT,
+        headers=tiktok_headers(access_token),
+        json=payload,
+        timeout=60
+    )
+    return r, payload
 
 def tiktok_status_fetch(access_token: str, publish_id: str):
     payload = {"publish_id": publish_id}
     r = requests.post(TIKTOK_STATUS_ENDPOINT, headers=tiktok_headers(access_token), json=payload, timeout=60)
     return r
-
-def _extract_tiktok_data(resp_json: dict):
-    """
-    Tries to handle common TikTok response shapes.
-    """
-    data = resp_json.get("data") or {}
-    err = resp_json.get("error") or {}
-    return data, err
 
 # -----------------------------
 # Health + debug
@@ -188,13 +161,11 @@ def health():
     return jsonify({
         "app": APP_NAME,
         "bucket": S3_BUCKET,
-        "has_aws_keys": bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY")),
         "region": AWS_REGION,
         "status": "ok",
+        "tiktok_allow_public": TIKTOK_ALLOW_PUBLIC,
         "tiktok_init": f"POST {TIKTOK_INIT_ENDPOINT}",
         "tiktok_status": f"POST {TIKTOK_STATUS_ENDPOINT}",
-        "single_chunk_max_bytes": TIKTOK_SINGLE_CHUNK_MAX_BYTES,
-        "fallback_chunk_size": TIKTOK_FALLBACK_CHUNK_SIZE,
         "time_utc": now_utc()
     })
 
@@ -209,68 +180,7 @@ def debug_routes():
     return jsonify({"routes": routes})
 
 # -----------------------------
-# S3 APIs
-# -----------------------------
-@app.route("/api/s3/check", methods=["POST"])
-def api_s3_check():
-    tid = trace_id()
-    try:
-        body = json_body()
-        key = body.get("s3_key")
-        if not key:
-            return jsonify({"status": "error", "message": "Missing 's3_key'.", "trace_id": tid}), 400
-
-        head = s3_head_object(S3_BUCKET, key)
-        content_type = head.get("ContentType") or "application/octet-stream"
-        size = int(head.get("ContentLength") or 0)
-        etag = head.get("ETag")
-
-        return jsonify({
-            "bucket": S3_BUCKET,
-            "content_type": content_type,
-            "etag": etag,
-            "s3_key": key,
-            "size": size,
-            "status": "ok",
-            "trace_id": tid
-        })
-    except Exception as e:
-        log.exception("s3/check failed")
-        return jsonify({"status": "error", "message": str(e), "trace_id": tid}), 500
-
-@app.route("/api/s3/presign", methods=["POST"])
-def api_s3_presign():
-    tid = trace_id()
-    try:
-        body = json_body()
-        key = body.get("s3_key")
-        expires = int(body.get("expires_seconds") or DEFAULT_EXPIRES_SECONDS)
-
-        if not key:
-            return jsonify({"status": "error", "message": "Missing 's3_key'.", "trace_id": tid}), 400
-
-        head = s3_head_object(S3_BUCKET, key)
-        size = int(head.get("ContentLength") or 0)
-        content_type = head.get("ContentType") or "application/octet-stream"
-
-        url = s3_presigned_get(S3_BUCKET, key, expires)
-
-        return jsonify({
-            "bucket": S3_BUCKET,
-            "content_type": content_type,
-            "expires_seconds": expires,
-            "s3_key": key,
-            "size": size,
-            "status": "ok",
-            "url": url,
-            "trace_id": tid
-        })
-    except Exception as e:
-        log.exception("s3/presign failed")
-        return jsonify({"status": "error", "message": str(e), "trace_id": tid}), 500
-
-# -----------------------------
-# TikTok APIs
+# TikTok status
 # -----------------------------
 @app.route("/api/tiktok/status", methods=["POST"])
 def api_tiktok_status():
@@ -299,63 +209,17 @@ def api_tiktok_status():
         log.exception("tiktok/status failed")
         return jsonify({"status": "error", "message": str(e), "trace_id": tid}), 500
 
-
-@app.route("/api/tiktok/publish_from_s3_pull", methods=["POST"])
-def api_tiktok_publish_from_s3_pull():
-    """
-    PULL_FROM_URL (will fail with url_ownership_unverified until TikTok verifies your domain).
-    """
-    tid = trace_id()
-    try:
-        body = json_body()
-        access_token = body.get("access_token")
-        s3_key = body.get("s3_key")
-        title = body.get("title", "Cre8 Studio Upload")
-        privacy_level = body.get("privacy_level", "SELF_ONLY")
-        expires_seconds = int(body.get("expires_seconds") or DEFAULT_EXPIRES_SECONDS)
-
-        if not access_token or not s3_key:
-            return jsonify({"status": "error", "message": "Missing 'access_token' or 's3_key'.", "trace_id": tid}), 400
-
-        presigned = s3_presigned_get(S3_BUCKET, s3_key, expires_seconds)
-
-        r = tiktok_init_pull_from_url(access_token, presigned, title, privacy_level)
-
-        out = {
-            "status": "ok" if r.ok else "error",
-            "message": "TikTok init ok." if r.ok else "TikTok init failed.",
-            "tiktok_http_status": r.status_code,
-            "tiktok_response": r.json() if r.headers.get("Content-Type", "").startswith("application/json") else r.text,
-            "video_url_used": presigned,
-            "trace_id": tid
-        }
-
-        if not r.ok:
-            try:
-                j = r.json()
-                err = (j.get("error") or {})
-                if err.get("code") == "url_ownership_unverified":
-                    out["hint"] = (
-                        "TikTok rejected pull_from_url because URL ownership is not verified. "
-                        "Use /api/tiktok/publish_from_s3_upload (Option B) or complete TikTok URL ownership verification."
-                    )
-            except Exception:
-                pass
-
-        return jsonify(out), (200 if r.ok else 400)
-
-    except Exception as e:
-        log.exception("tiktok/publish_from_s3_pull failed")
-        return jsonify({"status": "error", "message": str(e), "trace_id": tid}), 500
-
-
+# -----------------------------
+# TikTok publish (Option B)
+# -----------------------------
 @app.route("/api/tiktok/publish_from_s3_upload", methods=["POST"])
 def api_tiktok_publish_from_s3_upload():
     """
-    ✅ OPTION B: FILE_UPLOAD
-    - Downloads video from S3 (server side)
-    - Calls TikTok init with FILE_UPLOAD (single chunk for <=64MB)
-    - Uploads file to TikTok upload_url (single PUT for <=64MB)
+    ✅ FILE_UPLOAD
+    - Uploads from S3 -> TikTok upload_url
+    - Enforces public posting rules:
+        - If app unaudited, PUBLIC requests are blocked with a clear message.
+        - SELF_ONLY requests work for testing/review proof.
     """
     tid = trace_id()
     try:
@@ -363,11 +227,26 @@ def api_tiktok_publish_from_s3_upload():
         access_token = body.get("access_token")
         s3_key = body.get("s3_key")
         title = body.get("title", "Cre8 Studio Upload")
-        privacy_level = body.get("privacy_level", "SELF_ONLY")
+
+        requested_privacy = normalize_privacy_level(body.get("privacy_level", "SELF_ONLY"))
 
         if not access_token or not s3_key:
             return jsonify({"status": "error", "message": "Missing 'access_token' or 's3_key'.", "trace_id": tid}), 400
 
+        # If unaudited, block public request early (prevents wasting calls)
+        if requested_privacy != "SELF_ONLY" and not TIKTOK_ALLOW_PUBLIC:
+            return jsonify({
+                "status": "error",
+                "message": (
+                    "PUBLIC posting is currently blocked because TikTok classifies this client as unaudited. "
+                    "Use privacy_level=SELF_ONLY for now. After TikTok audit approval, set env TIKTOK_ALLOW_PUBLIC=1."
+                ),
+                "requested_privacy_level": requested_privacy,
+                "allowed_privacy_level_now": "SELF_ONLY",
+                "trace_id": tid
+            }), 403
+
+        # Head S3
         head = s3_head_object(S3_BUCKET, s3_key)
         size = int(head.get("ContentLength") or 0)
         content_type = head.get("ContentType") or "video/mp4"
@@ -382,11 +261,36 @@ def api_tiktok_publish_from_s3_upload():
                 "trace_id": tid
             }), 400
 
-        # 1) TikTok init FILE_UPLOAD
-        init_resp, init_payload = tiktok_init_file_upload(access_token, size, title, privacy_level)
+        # TikTok init
+        init_resp, init_payload = tiktok_init_file_upload(
+            access_token=access_token,
+            video_size=size,
+            title=title,
+            privacy_level=requested_privacy
+        )
+
         init_json = init_resp.json() if init_resp.headers.get("Content-Type", "").startswith("application/json") else None
 
         if not init_resp.ok:
+            # If TikTok tells us unaudited again, give a clean message
+            try:
+                err = (init_json or {}).get("error") or {}
+                if err.get("code") == "unaudited_client_can_only_post_to_private_accounts":
+                    return jsonify({
+                        "status": "error",
+                        "message": (
+                            "TikTok blocked PUBLIC posting because this app/client is unaudited. "
+                            "For now, you can only post using privacy_level=SELF_ONLY (private). "
+                            "To unlock public, you must pass TikTok Content Posting audit/review."
+                        ),
+                        "tiktok_http_status": init_resp.status_code,
+                        "tiktok_response": init_json or init_resp.text,
+                        "init_payload_sent": init_payload,
+                        "trace_id": tid
+                    }), 403
+            except Exception:
+                pass
+
             return jsonify({
                 "status": "error",
                 "message": "TikTok init failed.",
@@ -396,7 +300,7 @@ def api_tiktok_publish_from_s3_upload():
                 "trace_id": tid
             }), 400
 
-        data, err = _extract_tiktok_data(init_json or {})
+        data, _err = _extract_tiktok_data(init_json or {})
         upload_url = data.get("upload_url") or (data.get("upload_url_list", [None])[0] if isinstance(data.get("upload_url_list"), list) else None)
         publish_id = data.get("publish_id") or data.get("publishId") or data.get("publish_id_str")
 
@@ -409,61 +313,43 @@ def api_tiktok_publish_from_s3_upload():
                 "trace_id": tid
             }), 500
 
-        # 2) Stream-download from S3 and upload to TikTok
+        # Stream download from S3 and upload in a single PUT (works for your current file)
         obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
         body_stream = obj["Body"]
 
-        chunk_size, total_chunks, mode = _chunk_plan(size)
-
-        bytes_sent = 0
-        chunk_index = 0
-
-        while True:
-            chunk = body_stream.read(chunk_size)
-            if not chunk:
-                break
-
-            start = bytes_sent
-            end = bytes_sent + len(chunk) - 1
-            bytes_sent += len(chunk)
-            chunk_index += 1
-
-            headers = {
-                "Content-Type": content_type,
-                "Content-Range": f"bytes {start}-{end}/{size}"
-            }
-
-            put = requests.put(upload_url, headers=headers, data=chunk, timeout=300)
-            if not put.ok:
-                return jsonify({
-                    "status": "error",
-                    "message": "TikTok upload failed.",
-                    "upload_mode": mode,
-                    "chunk_index": chunk_index,
-                    "total_chunks_expected": total_chunks,
-                    "tiktok_http_status": put.status_code,
-                    "tiktok_response": put.text,
-                    "publish_id": publish_id,
-                    "trace_id": tid
-                }), 400
-
-        if bytes_sent != size:
+        chunk = body_stream.read(size)
+        if not chunk or len(chunk) != size:
             return jsonify({
                 "status": "error",
-                "message": "Upload finished but bytes_sent != size (incomplete upload).",
-                "bytes_sent": bytes_sent,
+                "message": "Failed to read full file from S3 stream.",
+                "bytes_read": len(chunk) if chunk else 0,
                 "size": size,
-                "upload_mode": mode,
+                "trace_id": tid
+            }), 500
+
+        headers = {
+            "Content-Type": content_type,
+            "Content-Range": f"bytes 0-{size-1}/{size}",
+            "Content-Length": str(size)
+        }
+
+        put = requests.put(upload_url, headers=headers, data=chunk, timeout=600)
+        if not put.ok:
+            return jsonify({
+                "status": "error",
+                "message": "TikTok upload failed.",
+                "tiktok_http_status": put.status_code,
+                "tiktok_response": put.text,
+                "publish_id": publish_id,
                 "trace_id": tid
             }), 400
 
-        # 3) Return publish_id so you can poll status
         return jsonify({
             "status": "ok",
             "message": "Upload completed. Now poll /api/tiktok/status using publish_id.",
             "publish_id": publish_id,
-            "upload_mode": mode,
-            "bytes_sent": bytes_sent,
+            "privacy_level_used": requested_privacy,
+            "bytes_sent": size,
             "size": size,
             "trace_id": tid
         }), 200
@@ -472,14 +358,12 @@ def api_tiktok_publish_from_s3_upload():
         log.exception("tiktok/publish_from_s3_upload failed")
         return jsonify({"status": "error", "message": str(e), "trace_id": tid}), 500
 
-
 # -----------------------------
 # Static (optional)
 # -----------------------------
 @app.route("/static/<path:filename>", methods=["GET"])
 def static_files(filename):
     return send_from_directory("static", filename)
-
 
 # -----------------------------
 # Local run (Koyeb uses Gunicorn)
