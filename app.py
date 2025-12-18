@@ -1,353 +1,254 @@
 import os
 import time
-import math
-import secrets
+import json
 import requests
 import boto3
-from urllib.parse import urlencode
-from flask import Flask, request, redirect, jsonify
-from google.cloud import firestore
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ---------------------------
-# TikTok OAuth / API
-# ---------------------------
-CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
-CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")
-SCOPES = os.getenv("TIKTOK_SCOPES", "video.publish,user.info.basic")
+# -----------------------------
+# AWS / S3
+# -----------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "fair-video-source")
 
-AUTHORIZE_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/"
-TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+)
 
-# Content Posting API (Direct Post)
-PUBLISH_INIT_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+def presign_s3_get_url(bucket: str, key: str, expires_seconds: int = 3600) -> str:
+    # URL TikTok can fetch directly
+    return s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=int(expires_seconds),
+    )
 
+def head_s3_object(bucket: str, key: str):
+    return s3.head_object(Bucket=bucket, Key=key)
 
-# ---------------------------
-# Firestore
-# ---------------------------
-PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
-COLL = os.getenv("TIKTOK_FIRESTORE_COLLECTION", "tiktok_accounts")
-db = firestore.Client(project=PROJECT_ID or None)
+# -----------------------------
+# TikTok API (configurable)
+# -----------------------------
+TIKTOK_BASE = os.getenv("TIKTOK_BASE", "https://open.tiktokapis.com")
 
+# Set these to match your project’s working endpoints:
+# If your current code uses another init endpoint, put it here.
+TIKTOK_VIDEO_INIT_ENDPOINT = os.getenv(
+    "TIKTOK_VIDEO_INIT_ENDPOINT",
+    f"{TIKTOK_BASE}/v2/post/publish/video/init/"
+)
 
-# ---------------------------
-# AWS S3
-# ---------------------------
-AWS_REGION = os.getenv("AWS_REGION", "")
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-s3 = boto3.client("s3", region_name=AWS_REGION or None)
+# Status endpoint can differ too; set it via env if needed.
+TIKTOK_STATUS_ENDPOINT = os.getenv(
+    "TIKTOK_STATUS_ENDPOINT",
+    f"{TIKTOK_BASE}/v2/post/publish/status/fetch/"
+)
 
-# Upload chunk size (bytes)
-# TikTok example uses 10,000,000. We'll default to that. :contentReference[oaicite:2]{index=2}
-TIKTOK_CHUNK_SIZE = int(os.getenv("TIKTOK_CHUNK_SIZE", "10000000"))
-
-# Cron protection
-CRON_SECRET = os.getenv("CRON_SECRET", "")
-
-
-def build_auth_url(state: str) -> str:
-    params = {
-        "client_key": CLIENT_KEY,
-        "scope": SCOPES,
-        "response_type": "code",
-        "redirect_uri": REDIRECT_URI,
-        "state": state,
+def tiktok_headers(access_token: str):
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=utf-8",
     }
-    return f"{AUTHORIZE_ENDPOINT}?{urlencode(params)}"
 
+# -----------------------------
+# Health check
+# -----------------------------
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
 
-def exchange_code_for_token(code: str) -> dict:
+# -----------------------------
+# S3 presign (debug helper)
+# -----------------------------
+@app.post("/api/s3/presign")
+def api_s3_presign():
+    data = request.get_json(force=True, silent=False)
+    s3_key = data.get("s3_key")
+    expires = int(data.get("expires_seconds", 3600))
+
+    if not s3_key:
+        return jsonify({"status": "error", "message": "Missing s3_key"}), 400
+
+    # confirm exists
+    meta = head_s3_object(S3_BUCKET, s3_key)
+    url = presign_s3_get_url(S3_BUCKET, s3_key, expires_seconds=expires)
+
+    return jsonify({
+        "status": "ok",
+        "bucket": S3_BUCKET,
+        "s3_key": s3_key,
+        "size": meta.get("ContentLength"),
+        "content_type": meta.get("ContentType"),
+        "expires_seconds": expires,
+        "url": url
+    }), 200
+
+# -----------------------------
+# TikTok publish using PULL_FROM_URL
+# -----------------------------
+@app.post("/api/tiktok/publish_from_s3_pull")
+def publish_from_s3_pull():
+    """
+    Body JSON:
+    {
+      "open_id": "xxx",
+      "access_token": "xxx",
+      "s3_key": "posted/.../file.mp4",
+      "title": "Cre8 Studio test post",
+      "privacy_level": "SELF_ONLY"
+    }
+    """
+    data = request.get_json(force=True, silent=False)
+
+    open_id = data.get("open_id")
+    access_token = data.get("access_token")
+    s3_key = data.get("s3_key")
+    title = data.get("title", "Cre8 Studio post")
+    privacy_level = data.get("privacy_level", "SELF_ONLY")
+
+    if not open_id:
+        return jsonify({"status": "error", "message": "Missing open_id"}), 400
+    if not access_token:
+        return jsonify({"status": "error", "message": "Missing access_token"}), 400
+    if not s3_key:
+        return jsonify({"status": "error", "message": "Missing s3_key"}), 400
+
+    # 1) confirm S3 object exists + get size
+    head = head_s3_object(S3_BUCKET, s3_key)
+    video_size = int(head.get("ContentLength", 0))
+    content_type = head.get("ContentType", "")
+
+    if video_size <= 0:
+        return jsonify({"status": "error", "message": "S3 object has invalid size"}), 400
+
+    # 2) generate pre-signed GET URL long enough for TikTok to fetch
+    # Use 2 hours by default (safe for slower pulls)
+    presigned_url = presign_s3_get_url(S3_BUCKET, s3_key, expires_seconds=7200)
+
+    # 3) TikTok init payload for pull-from-url
+    # NOTE: If your TikTok init endpoint expects different keys,
+    # adjust here (but keep source = PULL_FROM_URL + video_url).
     payload = {
-        "client_key": CLIENT_KEY,
-        "client_secret": CLIENT_SECRET,
-        "code": code,
-        "grant_type": "authorization_code",
-        "redirect_uri": REDIRECT_URI,
+        "open_id": open_id,
+        "post_info": {
+            "title": title,
+            "privacy_level": privacy_level,
+            # optional fields if you need later:
+            # "disable_comment": False,
+            # "disable_duet": False,
+            # "disable_stitch": False,
+        },
+        "source_info": {
+            "source": "PULL_FROM_URL",
+            "video_url": presigned_url,
+        }
     }
-    r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
+    # 4) Call TikTok init
+    r = requests.post(
+        TIKTOK_VIDEO_INIT_ENDPOINT,
+        headers=tiktok_headers(access_token),
+        data=json.dumps(payload),
+        timeout=60
+    )
 
-def refresh_access_token(refresh_token: str) -> dict:
-    payload = {
-        "client_key": CLIENT_KEY,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        out = r.json()
+    except Exception:
+        return jsonify({
+            "status": "error",
+            "http": r.status_code,
+            "message": "TikTok returned non-JSON response",
+            "raw": r.text[:2000]
+        }), 502
 
+    if r.status_code >= 400:
+        return jsonify({
+            "status": "error",
+            "http": r.status_code,
+            "step": "tiktok_init_pull",
+            "tiktok": out,
+            "debug": {
+                "bucket": S3_BUCKET,
+                "s3_key": s3_key,
+                "video_size": video_size,
+                "content_type": content_type,
+                "init_endpoint": TIKTOK_VIDEO_INIT_ENDPOINT
+            }
+        }), 400
 
-def is_token_expiring(acct: dict, skew_seconds: int = 120) -> bool:
-    obtained_at = int(acct.get("obtained_at") or 0)
-    expires_in = int(acct.get("expires_in") or 0)
-    if not obtained_at or not expires_in:
-        return True
-    return (time.time() >= (obtained_at + expires_in - skew_seconds))
+    # Common fields returned by TikTok depending on API variant:
+    # Some return data.publish_id, some return data.video_id.
+    data_node = out.get("data", {}) if isinstance(out, dict) else {}
+    publish_id = data_node.get("publish_id") or data_node.get("publishId")
+    video_id = data_node.get("video_id") or data_node.get("videoId")
 
+    return jsonify({
+        "status": "ok",
+        "step": "tiktok_init_pull",
+        "bucket": S3_BUCKET,
+        "s3_key": s3_key,
+        "video_size": video_size,
+        "presigned_url_expires_seconds": 7200,
+        "publish_id": publish_id,
+        "video_id": video_id,
+        "tiktok": out
+    }), 200
 
-def get_valid_access_token(open_id: str) -> str:
-    snap = db.collection(COLL).document(open_id).get()
-    if not snap.exists:
-        raise RuntimeError(f"No TikTok account found for open_id={open_id}")
-
-    acct = snap.to_dict() or {}
-    access_token = acct.get("access_token")
-    refresh_token = acct.get("refresh_token")
+# -----------------------------
+# TikTok status/poll endpoint
+# -----------------------------
+@app.get("/api/tiktok/status")
+def tiktok_status():
+    """
+    Query:
+      /api/tiktok/status?access_token=xxx&publish_id=yyy
+    """
+    access_token = request.args.get("access_token")
+    publish_id = request.args.get("publish_id")
+    video_id = request.args.get("video_id")
 
     if not access_token:
-        raise RuntimeError("Missing access_token in Firestore for this open_id")
+        return jsonify({"status": "error", "message": "Missing access_token"}), 400
+    if not publish_id and not video_id:
+        return jsonify({"status": "error", "message": "Missing publish_id or video_id"}), 400
 
-    # Auto-refresh if expiring/expired
-    if is_token_expiring(acct):
-        if not refresh_token:
-            raise RuntimeError("Access token expired and no refresh_token available")
-        new_tokens = refresh_access_token(refresh_token)
-        now = int(time.time())
+    # Different TikTok variants use different key names. We send both if provided.
+    payload = {}
+    if publish_id:
+        payload["publish_id"] = publish_id
+    if video_id:
+        payload["video_id"] = video_id
 
-        updated = {
-            "access_token": new_tokens.get("access_token"),
-            "refresh_token": new_tokens.get("refresh_token", refresh_token),
-            "expires_in": int(new_tokens.get("expires_in", 0) or 0),
-            "refresh_expires_in": int(new_tokens.get("refresh_expires_in", 0) or 0),
-            "scope": new_tokens.get("scope", acct.get("scope")),
-            "token_type": new_tokens.get("token_type", acct.get("token_type", "Bearer")),
-            "obtained_at": now,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-        db.collection(COLL).document(open_id).set(updated, merge=True)
-        access_token = updated["access_token"]
-
-        if not access_token:
-            raise RuntimeError("Token refresh succeeded but access_token missing in response")
-
-    return access_token
-
-
-def s3_head(key: str) -> dict:
-    if not S3_BUCKET:
-        raise RuntimeError("Missing S3_BUCKET env var")
-    return s3.head_object(Bucket=S3_BUCKET, Key=key)
-
-
-@app.get("/")
-def home():
-    return jsonify({"status": "ok", "service": "cre8-tiktok-auth-koyeb"})
-
-
-@app.get("/api/tiktok/connect")
-def tiktok_connect():
-    if not (CLIENT_KEY and CLIENT_SECRET and REDIRECT_URI):
-        return jsonify({"error": "Missing TikTok env vars"}), 500
-
-    state = secrets.token_urlsafe(24)
-    auth_url = build_auth_url(state)
-
-    resp = redirect(auth_url, code=302)
-    resp.set_cookie("tiktok_oauth_state", state, httponly=True, samesite="Lax", max_age=600)
-    return resp
-
-
-@app.get("/api/tiktok/callback")
-def tiktok_callback():
-    code = request.args.get("code")
-    state = request.args.get("state")
-    saved_state = request.cookies.get("tiktok_oauth_state")
-
-    if not code:
-        return jsonify({"error": "Missing code"}), 400
-    if not state or not saved_state or state != saved_state:
-        return jsonify({"error": "Invalid state"}), 400
-
-    token_json = exchange_code_for_token(code)
-    open_id = token_json.get("open_id")
-    if not open_id:
-        return jsonify({"error": "Token response missing open_id", "raw": token_json}), 500
-
-    now = int(time.time())
-    doc = {
-        "open_id": open_id,
-        "provider": "tiktok",
-        "scope": token_json.get("scope"),
-        "token_type": token_json.get("token_type", "Bearer"),
-        "access_token": token_json.get("access_token"),
-        "refresh_token": token_json.get("refresh_token"),
-        "expires_in": int(token_json.get("expires_in", 0) or 0),
-        "refresh_expires_in": int(token_json.get("refresh_expires_in", 0) or 0),
-        "obtained_at": now,
-        "updated_at": firestore.SERVER_TIMESTAMP,
-    }
-    db.collection(COLL).document(open_id).set(doc, merge=True)
-
-    return jsonify({"status": "connected", "open_id": open_id, "collection": COLL})
-
-
-# ---------------------------
-# S3: check that file exists
-# ---------------------------
-@app.post("/api/s3/check")
-def api_s3_check():
-    body = request.get_json(force=True) or {}
-    key = body.get("s3_key")
-    if not key:
-        return jsonify({"status": "error", "error": "Missing s3_key"}), 400
-    try:
-        meta = s3_head(key)
-        return jsonify({
-            "status": "ok",
-            "bucket": S3_BUCKET,
-            "s3_key": key,
-            "size": int(meta.get("ContentLength") or 0),
-            "content_type": meta.get("ContentType") or "",
-            "last_modified": str(meta.get("LastModified") or ""),
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-
-# ---------------------------
-# TikTok: FILE_UPLOAD from S3
-# ---------------------------
-@app.post("/api/tiktok/publish_from_s3")
-def tiktok_publish_from_s3():
-    body = request.get_json(force=True) or {}
-
-    open_id = body.get("open_id")
-    s3_key = body.get("s3_key")
-    title = body.get("title", "Cre8 Studio test post")
-    privacy_level = body.get("privacy_level", "SELF_ONLY")
-
-    if not open_id:
-        return jsonify({"status": "error", "error": "Missing open_id"}), 400
-    if not s3_key:
-        return jsonify({"status": "error", "error": "Missing s3_key"}), 400
+    r = requests.post(
+        TIKTOK_STATUS_ENDPOINT,
+        headers=tiktok_headers(access_token),
+        data=json.dumps(payload),
+        timeout=60
+    )
 
     try:
-        # 1) Ensure token valid (auto refresh)
-        access_token = get_valid_access_token(open_id)
-
-        # 2) Read S3 metadata
-        meta = s3_head(s3_key)
-        video_size = int(meta.get("ContentLength") or 0)
-        if video_size <= 0:
-            return jsonify({"status": "error", "error": "S3 file size is 0"}), 400
-
-        # TikTok requires chunk metadata for FILE_UPLOAD :contentReference[oaicite:3]{index=3}
-        chunk_size = min(TIKTOK_CHUNK_SIZE, video_size)
-        total_chunks = int(math.ceil(video_size / chunk_size))
-        if total_chunks < 1:
-            total_chunks = 1
-
-        # 3) Init publish with FILE_UPLOAD
-        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
-        init_payload = {
-            "post_info": {
-                "title": title,
-                "privacy_level": privacy_level,
-                "disable_comment": False,
-                "disable_duet": False,
-                "disable_stitch": False,
-            },
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": video_size,
-                "chunk_size": chunk_size,
-                "total_chunk_count": total_chunks,
-            },
-        }
-
-        init_res = requests.post(PUBLISH_INIT_ENDPOINT, headers=headers, json=init_payload, timeout=60)
-        init_json = init_res.json() if init_res.headers.get("content-type", "").startswith("application/json") else {"raw": init_res.text}
-
-        if init_res.status_code >= 400:
-            return jsonify({
-                "status": "error",
-                "step": "tiktok_init",
-                "http": init_res.status_code,
-                "tiktok": init_json,
-                "debug": {"video_size": video_size, "chunk_size": chunk_size, "total_chunks": total_chunks},
-            }), 400
-
-        data = init_json.get("data") or {}
-        publish_id = data.get("publish_id")
-        upload_url = data.get("upload_url")
-        if not upload_url:
-            return jsonify({"status": "error", "step": "tiktok_init", "error": "upload_url missing", "tiktok": init_json}), 400
-
-        # 4) Stream S3 -> TikTok upload_url in chunks
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
-        stream = obj["Body"]
-
-        sent = 0
-        chunk_index = 0
-
-        while sent < video_size:
-            chunk = stream.read(chunk_size)
-            if not chunk:
-                break
-
-            start = sent
-            end = sent + len(chunk) - 1
-
-            put_headers = {
-                "Content-Type": meta.get("ContentType") or "video/mp4",
-                "Content-Length": str(len(chunk)),
-                "Content-Range": f"bytes {start}-{end}/{video_size}",
-            }
-
-            put_res = requests.put(upload_url, headers=put_headers, data=chunk, timeout=120)
-            if put_res.status_code >= 400:
-                return jsonify({
-                    "status": "error",
-                    "step": "tiktok_upload",
-                    "http": put_res.status_code,
-                    "tiktok_upload_response": put_res.text[:500],
-                    "debug": {"start": start, "end": end, "video_size": video_size, "chunk_index": chunk_index},
-                }), 400
-
-            sent += len(chunk)
-            chunk_index += 1
-
-        if sent != video_size:
-            return jsonify({
-                "status": "error",
-                "step": "tiktok_upload",
-                "error": "Upload incomplete",
-                "debug": {"sent": sent, "video_size": video_size, "chunks_sent": chunk_index},
-            }), 400
-
+        out = r.json()
+    except Exception:
         return jsonify({
-            "status": "ok",
-            "publish_id": publish_id,
-            "uploaded_bytes": sent,
-            "video_size": video_size,
-            "chunk_size": chunk_size,
-            "total_chunks": total_chunks,
-            "note": "Upload complete. TikTok will process/publish asynchronously.",
-        })
+            "status": "error",
+            "http": r.status_code,
+            "message": "TikTok returned non-JSON response",
+            "raw": r.text[:2000]
+        }), 502
 
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-
-# ---------------------------
-# Optional: cron-protected refresh_all placeholder
-# ---------------------------
-@app.post("/api/tiktok/refresh_all")
-def tiktok_refresh_all():
-    got = request.headers.get("X-CRON-SECRET", "")
-    if not CRON_SECRET or got != CRON_SECRET:
-        return jsonify({"status": "error", "error": "Forbidden"}), 403
-    # Keep your earlier refresh_all logic here if you want.
-    return jsonify({"status": "ok", "message": "refresh_all stub - add your logic"})
+    return jsonify({
+        "status": "ok" if r.status_code < 400 else "error",
+        "http": r.status_code,
+        "endpoint": TIKTOK_STATUS_ENDPOINT,
+        "tiktok": out
+    }), 200
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
