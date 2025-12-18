@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -8,24 +7,31 @@ from datetime import datetime, timezone
 import boto3
 import requests
 from botocore.exceptions import ClientError
-
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 
-
-# -----------------------------
-# Config / Logging
-# -----------------------------
 APP_NAME = os.getenv("APP_NAME", "cre8-tiktok-auth-koyeb")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
 app = Flask(__name__)
-CORS(app)  # You can restrict origins later
 
+# ---- Simple CORS (no flask_cors needed) ----
+ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGINS
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+@app.route("/<path:_path>", methods=["OPTIONS"])
+def cors_preflight(_path):
+    return ("", 204)
 
 # -----------------------------
 # Environment (S3)
@@ -35,7 +41,6 @@ S3_BUCKET = os.getenv("S3_BUCKET", os.getenv("AWS_S3_BUCKET", "fair-video-source
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-
 HAS_AWS_KEYS = bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
 
 s3 = boto3.client(
@@ -44,7 +49,6 @@ s3 = boto3.client(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
 )
-
 
 # -----------------------------
 # TikTok Endpoints (v2)
@@ -57,10 +61,7 @@ TIKTOK_STATUS_ENDPOINT = os.getenv(
     "TIKTOK_STATUS_ENDPOINT",
     "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
 )
-
-# Safety: keep request timeout reasonable for Koyeb
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "25"))
-
 
 # -----------------------------
 # Helpers
@@ -113,22 +114,19 @@ def safe_log_json(label: str, obj: dict, max_len: int = 4000):
         s = s[:max_len] + "...(truncated)"
     logging.info("%s: %s", label, s)
 
-
 # -----------------------------
 # Global error handler
-# (THIS stops HTML 500 pages)
 # -----------------------------
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
     trace_id = make_trace_id()
     logging.exception("Unhandled exception trace_id=%s: %s", trace_id, str(e))
     return json_error(
-        "Internal server error in app. Check logs (Koyeb Console) using trace_id.",
+        "Internal server error in app. Check logs using trace_id.",
         trace_id,
         500,
         {"error_type": type(e).__name__},
     )
-
 
 # -----------------------------
 # Routes
@@ -146,7 +144,6 @@ def health():
         "tiktok_status": f"POST {TIKTOK_STATUS_ENDPOINT}",
     })
 
-
 @app.get("/debug/routes")
 def debug_routes():
     routes = []
@@ -154,7 +151,6 @@ def debug_routes():
         methods = sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])
         routes.append({"path": str(rule), "methods": methods})
     return jsonify({"routes": routes})
-
 
 @app.post("/api/s3/check")
 def api_s3_check():
@@ -182,7 +178,6 @@ def api_s3_check():
         logging.warning("S3 check failed trace_id=%s code=%s key=%s", trace_id, code, s3_key)
         return json_error("S3 object not found or not accessible.", trace_id, 404, {"s3_key": s3_key, "aws_error_code": code})
 
-
 @app.post("/api/s3/presign")
 def api_s3_presign():
     trace_id = make_trace_id()
@@ -194,9 +189,7 @@ def api_s3_presign():
     s3_key = data["s3_key"]
     expires_seconds = int(data.get("expires_seconds", 7200))
 
-    # Validate object exists
     meta = s3_head_object(s3_key)
-
     url = s3_presign_get_url(s3_key, expires_seconds=expires_seconds)
 
     return jsonify({
@@ -210,20 +203,8 @@ def api_s3_presign():
         "url": url,
     })
 
-
 @app.post("/api/tiktok/publish_from_s3_pull")
 def api_tiktok_publish_from_s3_pull():
-    """
-    Expected JSON body:
-    {
-      "access_token": "...",        (required)
-      "s3_key": "path/file.mp4",    (required)
-      "title": "My title",          (required)
-      "privacy_level": "SELF_ONLY", (optional)
-      "expires_seconds": 7200,      (optional)
-      "open_id": "..."              (optional; not required for the API call)
-    }
-    """
     trace_id = make_trace_id()
     data = request.get_json(silent=True) or {}
 
@@ -237,16 +218,12 @@ def api_tiktok_publish_from_s3_pull():
     privacy_level = data.get("privacy_level", "SELF_ONLY")
     expires_seconds = int(data.get("expires_seconds", 7200))
 
-    # 1) Validate S3 object + get metadata
     meta = s3_head_object(s3_key)
     size = int(meta.get("ContentLength", 0))
     content_type = meta.get("ContentType") or "video/mp4"
 
-    # 2) Create a presigned GET URL (TikTok will pull it)
     video_url = s3_presign_get_url(s3_key, expires_seconds=expires_seconds)
 
-    # 3) TikTok init payload for PULL_FROM_URL
-    # NOTE: TikTok expects JSON keys under post_info + source_info
     payload = {
         "post_info": {
             "title": title,
@@ -255,13 +232,10 @@ def api_tiktok_publish_from_s3_pull():
         "source_info": {
             "source": "PULL_FROM_URL",
             "video_url": video_url,
+            "video_size": size,
+            "content_type": content_type,
         },
     }
-
-    # Some TikTok environments like getting video size (safe to include)
-    # If TikTok ignores it, no harm; if it needs it, this helps.
-    payload["source_info"]["video_size"] = size
-    payload["source_info"]["content_type"] = content_type
 
     safe_log_json(f"[{trace_id}] TikTok init payload", {
         "post_info": payload["post_info"],
@@ -273,7 +247,6 @@ def api_tiktok_publish_from_s3_pull():
         }
     })
 
-    # 4) Call TikTok init
     resp = requests.post(
         TIKTOK_INIT_ENDPOINT,
         headers=tiktok_headers(access_token),
@@ -281,8 +254,6 @@ def api_tiktok_publish_from_s3_pull():
         timeout=HTTP_TIMEOUT,
     )
 
-    # Always return TikTok response as JSON (even if error)
-    # TikTok usually returns JSON with error code/message.
     try:
         resp_json = resp.json()
     except Exception:
@@ -293,7 +264,6 @@ def api_tiktok_publish_from_s3_pull():
         "body": resp_json
     })
 
-    # If TikTok returns non-200, expose it cleanly
     if resp.status_code >= 400:
         return jsonify({
             "status": "error",
@@ -303,7 +273,6 @@ def api_tiktok_publish_from_s3_pull():
             "tiktok_response": resp_json,
         }), 400
 
-    # Success: return publish_id (or whatever TikTok returns)
     return jsonify({
         "status": "ok",
         "trace_id": trace_id,
@@ -314,16 +283,8 @@ def api_tiktok_publish_from_s3_pull():
         "tiktok_response": resp_json,
     })
 
-
 @app.post("/api/tiktok/status")
 def api_tiktok_status():
-    """
-    Expected JSON body:
-    {
-      "access_token": "...",   (required)
-      "publish_id": "..."      (required)
-    }
-    """
     trace_id = make_trace_id()
     data = request.get_json(silent=True) or {}
 
@@ -369,10 +330,6 @@ def api_tiktok_status():
         "tiktok_response": resp_json,
     })
 
-
-# -----------------------------
-# Local run
-# -----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
