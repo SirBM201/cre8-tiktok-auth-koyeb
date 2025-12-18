@@ -59,7 +59,8 @@ TIKTOK_STATUS_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/status/fet
 
 # Upload tuning
 DEFAULT_EXPIRES_SECONDS = int(os.getenv("DEFAULT_EXPIRES_SECONDS", "7200"))
-TIKTOK_CHUNK_SIZE = int(os.getenv("TIKTOK_CHUNK_SIZE", str(4 * 1024 * 1024)))  # 4MB default
+TIKTOK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB REQUIRED by TikTok
+  # 4MB default
 S3_DOWNLOAD_MAX_MB = int(os.getenv("S3_DOWNLOAD_MAX_MB", "300"))  # safety
 
 # Boto3 client
@@ -448,3 +449,4 @@ def static_files(filename):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
