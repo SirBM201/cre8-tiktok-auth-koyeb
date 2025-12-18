@@ -1,6 +1,5 @@
 import os
 import math
-import time
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -59,8 +58,10 @@ TIKTOK_STATUS_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/status/fet
 
 # Upload tuning
 DEFAULT_EXPIRES_SECONDS = int(os.getenv("DEFAULT_EXPIRES_SECONDS", "7200"))
-TIKTOK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB REQUIRED by TikTok
-  # 4MB default
+
+# ✅ TikTok chunking: keep at 5MB
+TIKTOK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
+
 S3_DOWNLOAD_MAX_MB = int(os.getenv("S3_DOWNLOAD_MAX_MB", "300"))  # safety
 
 # Boto3 client
@@ -117,13 +118,11 @@ def tiktok_init_pull_from_url(access_token: str, video_url: str, title: str, pri
     r = requests.post(TIKTOK_INIT_ENDPOINT, headers=tiktok_headers(access_token), json=payload, timeout=60)
     return r
 
-def tiktok_init_file_upload(access_token: str, video_size: int, title: str, privacy_level: str):
+def tiktok_init_file_upload(access_token: str, video_size: int, title: str, privacy_level: str, chunk_size: int, total_chunk_count: int):
     """
-    Option B: FILE_UPLOAD.
-    TikTok returns an upload_url and a publish_id (or similar).
+    ✅ Option B: FILE_UPLOAD init.
+    The init MUST match the upload chunking exactly.
     """
-    total_chunks = int(math.ceil(video_size / float(TIKTOK_CHUNK_SIZE)))
-
     payload = {
         "post_info": {
             "title": title,
@@ -131,9 +130,9 @@ def tiktok_init_file_upload(access_token: str, video_size: int, title: str, priv
         },
         "source_info": {
             "source": "FILE_UPLOAD",
-            "video_size": video_size,
-            "chunk_size": TIKTOK_CHUNK_SIZE,
-            "total_chunk_count": total_chunks
+            "video_size": int(video_size),
+            "chunk_size": int(chunk_size),
+            "total_chunk_count": int(total_chunk_count)
         }
     }
 
@@ -149,7 +148,6 @@ def _extract_tiktok_data(resp_json: dict):
     """
     Tries to handle common TikTok response shapes.
     """
-    # Typically: {"data": {...}, "error": {...}}
     data = resp_json.get("data") or {}
     err = resp_json.get("error") or {}
     return data, err
@@ -167,6 +165,7 @@ def health():
         "status": "ok",
         "tiktok_init": f"POST {TIKTOK_INIT_ENDPOINT}",
         "tiktok_status": f"POST {TIKTOK_STATUS_ENDPOINT}",
+        "chunk_size_bytes": TIKTOK_CHUNK_SIZE,
         "time_utc": now_utc()
     })
 
@@ -275,8 +274,7 @@ def api_tiktok_status():
 @app.route("/api/tiktok/publish_from_s3_pull", methods=["POST"])
 def api_tiktok_publish_from_s3_pull():
     """
-    PULL_FROM_URL (will fail with url_ownership_unverified until TikTok verifies your domain).
-    Keeping it here for completeness and testing.
+    PULL_FROM_URL (fails with url_ownership_unverified until TikTok verifies your domain).
     """
     tid = trace_id()
     try:
@@ -290,12 +288,9 @@ def api_tiktok_publish_from_s3_pull():
         if not access_token or not s3_key:
             return jsonify({"status": "error", "message": "Missing 'access_token' or 's3_key'.", "trace_id": tid}), 400
 
-        # presigned URL (TikTok must accept and your domain must be verified by TikTok)
         presigned = s3_presigned_get(S3_BUCKET, s3_key, expires_seconds)
-
         r = tiktok_init_pull_from_url(access_token, presigned, title, privacy_level)
 
-        # Return TikTok response as-is, with extra context
         out = {
             "status": "ok" if r.ok else "error",
             "message": "TikTok init ok." if r.ok else "TikTok init failed.",
@@ -305,7 +300,6 @@ def api_tiktok_publish_from_s3_pull():
             "trace_id": tid
         }
 
-        # Helpful hint for the known blocker
         if not r.ok:
             try:
                 j = r.json()
@@ -329,9 +323,11 @@ def api_tiktok_publish_from_s3_pull():
 def api_tiktok_publish_from_s3_upload():
     """
     ✅ OPTION B: FILE_UPLOAD
-    - Downloads video from S3 (server side)
-    - Calls TikTok init with FILE_UPLOAD
-    - Uploads file to TikTok upload_url in chunks
+    - Reads S3 object size
+    - Computes total_chunk_count using math.ceil (MANDATORY)
+    - Calls TikTok init (FILE_UPLOAD)
+    - Streams from S3 and PUTs to TikTok upload_url with Content-Range
+    - Validates chunk count equals init chunk count
     """
     tid = trace_id()
     try:
@@ -344,7 +340,7 @@ def api_tiktok_publish_from_s3_upload():
         if not access_token or not s3_key:
             return jsonify({"status": "error", "message": "Missing 'access_token' or 's3_key'.", "trace_id": tid}), 400
 
-        # Head S3 first (size + type)
+        # 0) Head S3 first (size + type)
         head = s3_head_object(S3_BUCKET, s3_key)
         size = int(head.get("ContentLength") or 0)
         content_type = head.get("ContentType") or "video/mp4"
@@ -359,8 +355,26 @@ def api_tiktok_publish_from_s3_upload():
                 "trace_id": tid
             }), 400
 
-        # 1) TikTok init FILE_UPLOAD
-        init_resp = tiktok_init_file_upload(access_token, size, title, privacy_level)
+        # ✅ 1) MANDATORY TikTok chunk math (must match upload)
+        total_chunk_count = math.ceil(size / TIKTOK_CHUNK_SIZE)
+
+        log.info("TikTok chunk math: %s", {
+            "trace_id": tid,
+            "size": size,
+            "chunk_size": TIKTOK_CHUNK_SIZE,
+            "total_chunk_count": total_chunk_count
+        })
+
+        # 2) TikTok init FILE_UPLOAD using the SAME numbers
+        init_resp = tiktok_init_file_upload(
+            access_token=access_token,
+            video_size=size,
+            title=title,
+            privacy_level=privacy_level,
+            chunk_size=TIKTOK_CHUNK_SIZE,
+            total_chunk_count=total_chunk_count
+        )
+
         init_json = init_resp.json() if init_resp.headers.get("Content-Type", "").startswith("application/json") else None
 
         if not init_resp.ok:
@@ -369,7 +383,12 @@ def api_tiktok_publish_from_s3_upload():
                 "message": "TikTok init failed.",
                 "tiktok_http_status": init_resp.status_code,
                 "tiktok_response": init_json or init_resp.text,
-                "trace_id": tid
+                "trace_id": tid,
+                "debug_chunk_math": {
+                    "size": size,
+                    "chunk_size": TIKTOK_CHUNK_SIZE,
+                    "total_chunk_count": total_chunk_count
+                }
             }), 400
 
         data, err = _extract_tiktok_data(init_json or {})
@@ -384,11 +403,10 @@ def api_tiktok_publish_from_s3_upload():
                 "trace_id": tid
             }), 500
 
-        # 2) Stream-download from S3 and upload to TikTok in chunks
+        # 3) Stream-download from S3 and upload to TikTok in chunks
         obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
         body_stream = obj["Body"]
 
-        total_chunks = int(math.ceil(size / float(TIKTOK_CHUNK_SIZE)))
         bytes_sent = 0
         chunk_index = 0
 
@@ -402,31 +420,54 @@ def api_tiktok_publish_from_s3_upload():
             bytes_sent += len(chunk)
             chunk_index += 1
 
-            # TikTok upload usually expects Content-Range
             headers = {
                 "Content-Type": content_type,
-                "Content-Range": f"bytes {start}-{end}/{size}"
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Content-Length": str(len(chunk))
             }
 
-            put = requests.put(upload_url, headers=headers, data=chunk, timeout=120)
+            put = requests.put(upload_url, headers=headers, data=chunk, timeout=180)
             if not put.ok:
                 return jsonify({
                     "status": "error",
                     "message": "TikTok upload chunk failed.",
                     "chunk_index": chunk_index,
-                    "total_chunks": total_chunks,
+                    "expected_total_chunk_count": total_chunk_count,
                     "tiktok_http_status": put.status_code,
                     "tiktok_response": put.text,
                     "trace_id": tid
                 }), 400
 
-        # 3) Return publish_id so you can poll status
+        # ✅ 4) Final validations (these prevent TikTok chunk-count mismatch)
+        if bytes_sent != size:
+            return jsonify({
+                "status": "error",
+                "message": "Upload finished but bytes_sent != size (stream mismatch).",
+                "bytes_sent": bytes_sent,
+                "size": size,
+                "trace_id": tid
+            }), 500
+
+        if chunk_index != total_chunk_count:
+            return jsonify({
+                "status": "error",
+                "message": "Upload finished but chunk_index != total_chunk_count (TikTok will reject).",
+                "chunk_index": chunk_index,
+                "total_chunk_count": total_chunk_count,
+                "size": size,
+                "chunk_size": TIKTOK_CHUNK_SIZE,
+                "trace_id": tid
+            }), 500
+
+        # 5) Return publish_id so you can poll status
         return jsonify({
             "status": "ok",
             "message": "Upload completed. Now poll /api/tiktok/status using publish_id.",
             "publish_id": publish_id,
             "bytes_sent": bytes_sent,
             "size": size,
+            "chunk_size": TIKTOK_CHUNK_SIZE,
+            "total_chunk_count": total_chunk_count,
             "trace_id": tid
         }), 200
 
@@ -449,4 +490,3 @@ def static_files(filename):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-
